@@ -34,7 +34,7 @@
 
 metadata {
     definition(
-        name: "Shelly 2PM Gen4 Matter Driver(MR version)",
+        name: "Shelly 2PM Gen4 Matter Driver",
         namespace: "shelly",
         author: "Community",
     ) {
@@ -145,6 +145,16 @@ private int relayNumberForEndpoint(int ep) {
 // ---------------------------------------------------------------------------
 def installed() {
     logInfo "Installing Shelly 2PM Gen4 (Matter)..."
+    // Initialize all per-relay attributes so they appear in dashboard dropdowns
+    sendEvent(name: "switch1", value: "off")
+    sendEvent(name: "switch2", value: "off")
+    sendEvent(name: "power", value: 0, unit: "W")
+    sendEvent(name: "power1", value: 0, unit: "W")
+    sendEvent(name: "power2", value: 0, unit: "W")
+    sendEvent(name: "current", value: 0, unit: "A")
+    sendEvent(name: "current1", value: 0, unit: "A")
+    sendEvent(name: "current2", value: 0, unit: "A")
+    sendEvent(name: "voltage", value: 0, unit: "V")
     sendEvent(name: "energy", value: 0, unit: "kWh")
     sendEvent(name: "energy1", value: 0, unit: "kWh")
     sendEvent(name: "energy2", value: 0, unit: "kWh")
@@ -154,10 +164,6 @@ def installed() {
     sendEvent(name: "apparentPower", value: 0, unit: "VA")
     sendEvent(name: "apparentPower1", value: 0, unit: "VA")
     sendEvent(name: "apparentPower2", value: 0, unit: "VA")
-    sendEvent(name: "power1", value: 0, unit: "W")
-	sendEvent(name: "power2", value: 0, unit: "W")
-	sendEvent(name: "current1", value: 0, unit: "A")
-	sendEvent(name: "current2", value: 0, unit: "A")
     initialize()
 }
 
@@ -170,6 +176,24 @@ def updated() {
 def initialize() {
     logInfo "Initializing Shelly 2PM Gen4 (Matter)..."
     unschedule()
+
+    // Ensure all per-relay attributes exist (so they show in dashboard dropdowns)
+    ["switch1", "switch2"].each { attr ->
+        if (device.currentValue(attr) == null) sendEvent(name: attr, value: "off")
+    }
+    ["power1", "power2"].each { attr ->
+        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "W")
+    }
+    ["current1", "current2"].each { attr ->
+        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "A")
+    }
+    ["energy1", "energy2"].each { attr ->
+        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "kWh")
+    }
+    if (device.currentValue("voltage") == null) sendEvent(name: "voltage", value: 0, unit: "V")
+    if (device.currentValue("power") == null) sendEvent(name: "power", value: 0, unit: "W")
+    if (device.currentValue("current") == null) sendEvent(name: "current", value: 0, unit: "A")
+    if (device.currentValue("energy") == null) sendEvent(name: "energy", value: 0, unit: "kWh")
 
     if (logEnable) {
         runIn(1800, logsOff)
