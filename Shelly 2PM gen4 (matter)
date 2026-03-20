@@ -1,5 +1,5 @@
 /**
- *  Shelly 2PM Gen4 Matter Driver for Hubitat
+ *  Shelly 2PM Gen4 Matter Driver for Hubitat MR ver 3
  *
  *  Copyright 2025
  *
@@ -16,25 +16,20 @@
  *  1. The Shelly 2PM Gen4 ships with Matter firmware by default
  *  2. If your device was switched to Zigbee mode, press the button 5 times to return to Matter
  *  3. Use the Shelly app or web UI to commission the device and obtain a Matter pairing code
- *  4. In Hubitat: Settings → Matter → Add Device → enter the pairing code
- *
- *  NOTE: Matter endpoint numbering may vary by firmware version.
- *  After pairing, check the device's Matter descriptor to confirm which endpoints
- *  correspond to Relay 1 and Relay 2. The defaults here assume EP 1 and EP 2.
- *  If your device uses different endpoints (e.g., EP 2 and EP 3), update the
- *  ENDPOINT_RELAY1 and ENDPOINT_RELAY2 preferences accordingly.
+ *  4. In Hubitat: Settings > Matter > Add Device > enter the pairing code
  *
  *  Change History:
  *
  *    Date        Version   What
  *    ----        -------   ----
- *    2025-03-20  1.0.0     Initial Matter version (rewritten from Zigbee driver)
+ *    2026-03-20  1.0.0     Initial Matter version (rewritten from Zigbee driver)
+ *    2026-03-20  1.1.0     Added diagnostic logging and test commands for electrical clusters
  *
  */
 
 metadata {
     definition(
-        name: "Shelly 2PM Gen4 Matter Driver",
+        name: "Shelly 2PM Gen4 Matter Driver MR ver 3",
         namespace: "shelly",
         author: "Community",
     ) {
@@ -81,14 +76,19 @@ metadata {
         command "resetEnergy"
         command "syncChildDevices"
         command "calculateAllPowerFactors"
+
+        // Diagnostic commands - use these to troubleshoot electrical readings
+        command "diagnoseElectrical"
+        command "testReadSingleAttr"
+        command "scanAllEndpoints"
     }
 
     preferences {
         section("Endpoint Configuration") {
             input name: "endpointRelay1", type: "number", title: "Matter Endpoint for Relay 1",
-                  description: "Check your device's Matter descriptor after pairing", defaultValue: 1, range: "1..10"
+                  description: "Check your device's Matter descriptor after pairing", defaultValue: 1, range: "1..20"
             input name: "endpointRelay2", type: "number", title: "Matter Endpoint for Relay 2",
-                  description: "Check your device's Matter descriptor after pairing", defaultValue: 2, range: "1..10"
+                  description: "Check your device's Matter descriptor after pairing", defaultValue: 2, range: "1..20"
         }
         section("Reporting") {
             input name: "refreshInterval", type: "enum", title: "Auto-Refresh Interval",
@@ -107,26 +107,36 @@ metadata {
 }
 
 // ---------------------------------------------------------------------------
-// Matter Cluster IDs
+// Matter Cluster IDs (from Matter 1.2+ specification)
 // ---------------------------------------------------------------------------
 @groovy.transform.Field static final int CLUSTER_ON_OFF                    = 0x0006
 @groovy.transform.Field static final int CLUSTER_ELECTRICAL_POWER_MEAS     = 0x0090
 @groovy.transform.Field static final int CLUSTER_ELECTRICAL_ENERGY_MEAS    = 0x0091
-@groovy.transform.Field static final int CLUSTER_POWER_TOPOLOGY            = 0x009C
 
-// On/Off cluster attributes & commands
+// On/Off cluster
 @groovy.transform.Field static final int ATTR_ON_OFF                       = 0x0000
 @groovy.transform.Field static final int CMD_OFF                           = 0x00
 @groovy.transform.Field static final int CMD_ON                            = 0x01
 @groovy.transform.Field static final int CMD_TOGGLE                        = 0x02
 
-// Electrical Power Measurement attributes (cluster 0x0090)
-@groovy.transform.Field static final int ATTR_ACTIVE_POWER                 = 0x0008  // ActivePower (mW, int64s)
-@groovy.transform.Field static final int ATTR_VOLTAGE                      = 0x0004  // Voltage (mV, int64s)
-@groovy.transform.Field static final int ATTR_ACTIVE_CURRENT               = 0x0005  // ActiveCurrent (mA, int64s)
+// Electrical Power Measurement cluster (0x0090) attributes
+@groovy.transform.Field static final int ATTR_POWER_MODE                   = 0x0000
+@groovy.transform.Field static final int ATTR_NUM_MEAS_TYPES               = 0x0001
+@groovy.transform.Field static final int ATTR_VOLTAGE                      = 0x0004
+@groovy.transform.Field static final int ATTR_ACTIVE_CURRENT               = 0x0005
+@groovy.transform.Field static final int ATTR_REACTIVE_CURRENT             = 0x0006
+@groovy.transform.Field static final int ATTR_APPARENT_CURRENT             = 0x0007
+@groovy.transform.Field static final int ATTR_ACTIVE_POWER                 = 0x0008
+@groovy.transform.Field static final int ATTR_REACTIVE_POWER               = 0x0009
+@groovy.transform.Field static final int ATTR_APPARENT_POWER               = 0x000A
+@groovy.transform.Field static final int ATTR_RMS_VOLTAGE                  = 0x000B
+@groovy.transform.Field static final int ATTR_RMS_CURRENT                  = 0x000C
+@groovy.transform.Field static final int ATTR_RMS_POWER                    = 0x000D
+@groovy.transform.Field static final int ATTR_POWER_FACTOR                 = 0x000F
 
-// Electrical Energy Measurement attributes (cluster 0x0091)
-@groovy.transform.Field static final int ATTR_CUMULATIVE_ENERGY_IMPORTED   = 0x0001  // CumulativeEnergyImported
+// Electrical Energy Measurement cluster (0x0091) attributes
+@groovy.transform.Field static final int ATTR_CUMULATIVE_ENERGY_IMPORTED   = 0x0001
+@groovy.transform.Field static final int ATTR_PERIODIC_ENERGY_IMPORTED     = 0x0002
 
 // ---------------------------------------------------------------------------
 // Endpoint helpers
@@ -144,8 +154,9 @@ private int relayNumberForEndpoint(int ep) {
 // Lifecycle
 // ---------------------------------------------------------------------------
 def installed() {
-    logInfo "Installing Shelly 2PM Gen4 (Matter)..."
-    // Initialize all per-relay attributes so they appear in dashboard dropdowns
+    log.info "${device.label ?: device.name}: Installing Shelly 2PM Gen4 (Matter)..."
+    // Initialize ALL attributes so they show up in dashboard dropdowns
+    sendEvent(name: "switch", value: "off")
     sendEvent(name: "switch1", value: "off")
     sendEvent(name: "switch2", value: "off")
     sendEvent(name: "power", value: 0, unit: "W")
@@ -177,24 +188,6 @@ def initialize() {
     logInfo "Initializing Shelly 2PM Gen4 (Matter)..."
     unschedule()
 
-    // Ensure all per-relay attributes exist (so they show in dashboard dropdowns)
-    ["switch1", "switch2"].each { attr ->
-        if (device.currentValue(attr) == null) sendEvent(name: attr, value: "off")
-    }
-    ["power1", "power2"].each { attr ->
-        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "W")
-    }
-    ["current1", "current2"].each { attr ->
-        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "A")
-    }
-    ["energy1", "energy2"].each { attr ->
-        if (device.currentValue(attr) == null) sendEvent(name: attr, value: 0, unit: "kWh")
-    }
-    if (device.currentValue("voltage") == null) sendEvent(name: "voltage", value: 0, unit: "V")
-    if (device.currentValue("power") == null) sendEvent(name: "power", value: 0, unit: "W")
-    if (device.currentValue("current") == null) sendEvent(name: "current", value: 0, unit: "A")
-    if (device.currentValue("energy") == null) sendEvent(name: "energy", value: 0, unit: "kWh")
-
     if (logEnable) {
         runIn(1800, logsOff)
     }
@@ -221,30 +214,33 @@ def initialize() {
 def configure() {
     logInfo "Configuring Matter subscriptions..."
 
-    // Subscribe to On/Off attribute reports for both relay endpoints
     List<Map<String,String>> attrPaths = []
 
-    // On/Off for both relays
-    attrPaths += [endpointId: String.format("%02X", getEP1()), clusterId: "0006", attributeId: "0000"]
-    attrPaths += [endpointId: String.format("%02X", getEP2()), clusterId: "0006", attributeId: "0000"]
-
-    // Electrical Power Measurement – active power, voltage, current
     [getEP1(), getEP2()].each { ep ->
         def epHex = String.format("%02X", ep)
-        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0008"]  // ActivePower
+        // On/Off
+        attrPaths += [endpointId: epHex, clusterId: "0006", attributeId: "0000"]
+        // Electrical Power Measurement - try all possible attribute IDs
         attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0004"]  // Voltage
         attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0005"]  // ActiveCurrent
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0008"]  // ActivePower
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000B"]  // RMS Voltage
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000C"]  // RMS Current
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000D"]  // RMS Power
+        // Electrical Energy Measurement
         attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: "0001"]  // CumulativeEnergyImported
     }
 
-    // Subscribe with min interval 10s, max interval 300s
-    sendToDevice(matter.subscribe(10, 300, attrPaths))
+    String cmd = matter.subscribe(10, 300, attrPaths)
+    log.info "${device.label ?: device.name}: Sending subscribe command (${attrPaths.size()} attributes)"
+    if (logEnable) log.debug "${device.label ?: device.name}: Subscribe raw: ${cmd?.take(300)}..."
+    sendToDevice(cmd)
 
     logInfo "Matter subscriptions configured for endpoints ${getEP1()} and ${getEP2()}"
 }
 
 // ---------------------------------------------------------------------------
-// Refresh scheduling
+// Refresh
 // ---------------------------------------------------------------------------
 private void scheduleRefresh() {
     switch (refreshInterval ?: "5 minutes") {
@@ -264,13 +260,126 @@ def refresh() {
     [getEP1(), getEP2()].each { ep ->
         def epHex = String.format("%02X", ep)
         attrPaths += [endpointId: epHex, clusterId: "0006", attributeId: "0000"]  // On/Off
-        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0008"]  // ActivePower
         attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0004"]  // Voltage
         attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0005"]  // ActiveCurrent
-        attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: "0001"]  // CumulativeEnergy
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0008"]  // ActivePower
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000B"]  // RMS Voltage
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000C"]  // RMS Current
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000D"]  // RMS Power
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "000F"]  // Power Factor
+        attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: "0001"]  // CumulativeEnergyImported
+        attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: "0002"]  // PeriodicEnergyImported
     }
 
-    sendToDevice(matter.readAttributes(attrPaths))
+    String cmd = matter.readAttributes(attrPaths)
+    if (logEnable) log.debug "${device.label ?: device.name}: Refresh command: ${cmd?.take(300)}..."
+    sendToDevice(cmd)
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC COMMANDS
+// ---------------------------------------------------------------------------
+
+// Step 1: Read On/Off (known to work) then Power separately
+def testReadSingleAttr() {
+    log.info "${device.label ?: device.name}: === TEST: Sequential single-attribute reads ==="
+
+    def epHex = String.format("%02X", getEP1())
+
+    // Read On/Off first (we know this works)
+    String cmd1 = matter.readAttributes([[endpointId: epHex, clusterId: "0006", attributeId: "0000"]])
+    log.info "${device.label ?: device.name}: TEST sending On/Off read: ${cmd1}"
+    sendToDevice(cmd1)
+
+    // Then read power after a delay
+    runIn(2, "testReadPowerStep")
+}
+
+def testReadPowerStep() {
+    def epHex = String.format("%02X", getEP1())
+    String cmd = matter.readAttributes([[endpointId: epHex, clusterId: "0090", attributeId: "0008"]])
+    log.info "${device.label ?: device.name}: TEST sending ActivePower read: ${cmd}"
+    sendToDevice(cmd)
+
+    runIn(2, "testReadVoltageStep")
+}
+
+def testReadVoltageStep() {
+    def epHex = String.format("%02X", getEP1())
+    String cmd = matter.readAttributes([[endpointId: epHex, clusterId: "0090", attributeId: "0004"]])
+    log.info "${device.label ?: device.name}: TEST sending Voltage read: ${cmd}"
+    sendToDevice(cmd)
+}
+
+// Step 2: Read all attributes from 0x0090 and 0x0091
+def diagnoseElectrical() {
+    log.info "${device.label ?: device.name}: === ELECTRICAL DIAGNOSTIC ==="
+    log.info "${device.label ?: device.name}: Make sure Debug Logging is ON, then check Logs tab"
+
+    def epHex = String.format("%02X", getEP1())
+
+    // Read every attribute 0x0000 through 0x0010 from electrical power cluster
+    List<Map<String,String>> attrPaths = []
+    for (int attr = 0; attr <= 0x0010; attr++) {
+        def attrHex = String.format("%04X", attr)
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: attrHex]
+    }
+
+    String cmd = matter.readAttributes(attrPaths)
+    log.info "${device.label ?: device.name}: Reading ${attrPaths.size()} attrs from cluster 0x0090 EP${getEP1()}"
+    log.info "${device.label ?: device.name}: Raw command: ${cmd?.take(400)}"
+    sendToDevice(cmd)
+
+    runIn(3, "diagnoseEnergyCluster")
+}
+
+def diagnoseEnergyCluster() {
+    def epHex = String.format("%02X", getEP1())
+
+    List<Map<String,String>> attrPaths = []
+    for (int attr = 0; attr <= 0x0005; attr++) {
+        def attrHex = String.format("%04X", attr)
+        attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: attrHex]
+    }
+
+    String cmd = matter.readAttributes(attrPaths)
+    log.info "${device.label ?: device.name}: Reading ${attrPaths.size()} attrs from cluster 0x0091 EP${getEP1()}"
+    sendToDevice(cmd)
+
+    runIn(3, "diagnoseEP2Electrical")
+}
+
+def diagnoseEP2Electrical() {
+    def epHex = String.format("%02X", getEP2())
+
+    List<Map<String,String>> attrPaths = []
+    for (int attr = 0; attr <= 0x0010; attr++) {
+        def attrHex = String.format("%04X", attr)
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: attrHex]
+    }
+
+    String cmd = matter.readAttributes(attrPaths)
+    log.info "${device.label ?: device.name}: Reading ${attrPaths.size()} attrs from cluster 0x0090 EP${getEP2()}"
+    sendToDevice(cmd)
+
+    log.info "${device.label ?: device.name}: === DIAGNOSTIC COMPLETE - check logs for PARSE lines ==="
+}
+
+// Step 3: Scan all endpoints 0-10
+def scanAllEndpoints() {
+    log.info "${device.label ?: device.name}: === SCANNING ENDPOINTS 0-10 ==="
+
+    List<Map<String,String>> attrPaths = []
+    for (int ep = 0; ep <= 10; ep++) {
+        def epHex = String.format("%02X", ep)
+        attrPaths += [endpointId: epHex, clusterId: "0006", attributeId: "0000"]  // On/Off
+        attrPaths += [endpointId: epHex, clusterId: "0090", attributeId: "0008"]  // ActivePower
+        attrPaths += [endpointId: epHex, clusterId: "0091", attributeId: "0001"]  // Energy
+    }
+
+    String cmd = matter.readAttributes(attrPaths)
+    log.info "${device.label ?: device.name}: Scanning ${attrPaths.size()} attributes across endpoints 0-10"
+    sendToDevice(cmd)
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +432,6 @@ def off2() {
 def toggle1() {
     logInfo "Toggling relay 1 (endpoint ${getEP1()})"
     sendToDevice(matter.invoke(getEP1(), CLUSTER_ON_OFF, CMD_TOGGLE))
-    // State will update when the report comes back
     runIn(1, "refresh")
 }
 
@@ -349,8 +457,6 @@ def resetEnergy() {
     sendEvent(name: "energy2", value: 0, unit: "kWh")
     updateChildDevice(1, "energy", 0)
     updateChildDevice(2, "energy", 0)
-    state.energyOffset1 = device.currentValue("energy1") ?: 0
-    state.energyOffset2 = device.currentValue("energy2") ?: 0
     logInfo "Energy counters reset"
 }
 
@@ -385,7 +491,6 @@ private calculatePowerFactorForEndpoint(int relayNum) {
         updateChildDevice(relayNum, "apparentPower", apparentPower)
         updateChildDevice(relayNum, "powerFactor", powerFactor)
 
-        // Recalculate totals
         def ap1 = relayNum == 1 ? apparentPower : (device.currentValue("apparentPower1") ?: 0)
         def ap2 = relayNum == 2 ? apparentPower : (device.currentValue("apparentPower2") ?: 0)
         def totalAP = ap1 + ap2
@@ -396,53 +501,75 @@ private calculatePowerFactorForEndpoint(int relayNum) {
         def totalP = p1 + p2
         def overallPF = totalAP > 0 ? Math.min(1.0, Math.round((totalP / totalAP) * 1000) / 1000.0) : 1.0
         sendEvent(name: "powerFactor", value: overallPF)
-
-        if (logEnable) logDebug "Relay ${relayNum}: V=${voltage}V, I=${current}A, P=${activePower}W, S=${apparentPower}VA, PF=${powerFactor}"
     }
 }
 
 // ---------------------------------------------------------------------------
 // Matter Message Parsing
+//
+// This version logs EVERYTHING at info level when debug is on
+// to help identify what the device is actually sending back.
 // ---------------------------------------------------------------------------
 def parse(String description) {
-    if (logEnable) logDebug "Parsing: ${description}"
+    // ALWAYS log raw incoming messages when debug is enabled
+    if (logEnable) log.info "${device.label ?: device.name}: PARSE RAW: ${description}"
 
-    if (!description) return
+    if (!description) {
+        if (logEnable) log.info "${device.label ?: device.name}: PARSE: empty description received"
+        return
+    }
 
     try {
         def descMap = matter.parseDescriptionAsMap(description)
+
+        if (logEnable) log.info "${device.label ?: device.name}: PARSE MAP: ${descMap}"
+
         if (descMap) {
-            processMatterMessage(descMap)
+            // Handle both single map and list of maps
+            if (descMap instanceof List) {
+                descMap.each { item ->
+                    if (item instanceof Map) {
+                        processMatterMessage(item)
+                    }
+                }
+            } else if (descMap instanceof Map) {
+                processMatterMessage(descMap)
+            } else {
+                log.warn "${device.label ?: device.name}: PARSE: Unexpected response type: ${descMap}"
+            }
         }
     } catch (Exception e) {
-        if (logEnable) logDebug "Error parsing Matter message: ${e.message}"
+        log.warn "${device.label ?: device.name}: PARSE ERROR: ${e.message}"
+        log.warn "${device.label ?: device.name}: PARSE ERROR description: ${description?.take(300)}"
     }
 }
 
 private void processMatterMessage(Map descMap) {
-    if (!descMap?.endpoint || !descMap?.cluster || !descMap?.attrId) {
-        if (logEnable) logDebug "Incomplete Matter message: ${descMap}"
+    if (logEnable) log.info "${device.label ?: device.name}: PROCESSING: ${descMap}"
+
+    if (!descMap?.cluster) {
+        if (logEnable) log.info "${device.label ?: device.name}: SKIP: no cluster field, keys=${descMap?.keySet()}"
         return
     }
 
     def endpoint = 0
     def cluster = 0
-    def attrId = 0
+    def attrId = -1
 
     try {
-        endpoint = Integer.parseInt(descMap.endpoint, 16)
+        if (descMap.endpoint) endpoint = Integer.parseInt(descMap.endpoint, 16)
         cluster = Integer.parseInt(descMap.cluster, 16)
-        attrId = Integer.parseInt(descMap.attrId, 16)
+        if (descMap.attrId) attrId = Integer.parseInt(descMap.attrId, 16)
     } catch (Exception e) {
-        if (logEnable) logDebug "Error parsing IDs: ${e.message}"
+        log.warn "${device.label ?: device.name}: ID parse error: ${e.message}, descMap=${descMap}"
         return
     }
 
     def relayNum = relayNumberForEndpoint(endpoint)
-    if (relayNum == 0 && cluster != CLUSTER_ELECTRICAL_POWER_MEAS) {
-        // Could be a shared endpoint (e.g., voltage on EP 0)
-        if (logEnable) logDebug "Unknown endpoint ${endpoint} for cluster 0x${String.format('%04X', cluster)}"
-    }
+
+    if (logEnable) log.info "${device.label ?: device.name}: DECODED: ep=${endpoint}(relay${relayNum}), " +
+        "cluster=0x${String.format('%04X', cluster)}, attr=0x${attrId >= 0 ? String.format('%04X', attrId) : 'none'}, " +
+        "value=${descMap.value}"
 
     switch (cluster) {
         case CLUSTER_ON_OFF:
@@ -455,8 +582,11 @@ private void processMatterMessage(Map descMap) {
             processElectricalEnergy(descMap, endpoint, attrId, relayNum)
             break
         default:
-            if (logEnable) logDebug "Unhandled cluster 0x${String.format('%04X', cluster)}, " +
-                "endpoint=${endpoint}, attrId=0x${String.format('%04X', attrId)}, value=${descMap.value}"
+            // Log ALL unhandled clusters so we can discover what the device reports
+            log.info "${device.label ?: device.name}: OTHER CLUSTER: " +
+                "0x${String.format('%04X', cluster)}, ep=${endpoint}, " +
+                "attr=0x${attrId >= 0 ? String.format('%04X', attrId) : 'none'}, " +
+                "value=${descMap.value}"
             break
     }
 
@@ -477,7 +607,7 @@ private void processOnOff(Map descMap, int endpoint, int attrId, int relayNum) {
         updateChildDevice(relayNum, "switch", switchState)
         if (txtEnable) logInfo "Relay ${relayNum} is ${switchState}"
     } else {
-        if (logEnable) logDebug "On/Off report from unexpected endpoint ${endpoint}: ${switchState}"
+        log.info "${device.label ?: device.name}: On/Off from unexpected endpoint ${endpoint}: ${switchState}"
     }
 }
 
@@ -485,56 +615,119 @@ private void processOnOff(Map descMap, int endpoint, int attrId, int relayNum) {
 // Electrical Power Measurement Processing (Cluster 0x0090)
 // ---------------------------------------------------------------------------
 private void processElectricalPower(Map descMap, int endpoint, int attrId, int relayNum) {
-    if (!descMap.value) return
+    if (!descMap.value) {
+        log.info "${device.label ?: device.name}: Power cluster - no value, attr=0x${String.format('%04X', attrId)}"
+        return
+    }
+
+    // ALWAYS log electrical data
+    log.info "${device.label ?: device.name}: ELECTRICAL: ep=${endpoint}(relay${relayNum}), " +
+        "attr=0x${String.format('%04X', attrId)}, rawHex=${descMap.value}"
 
     try {
         def rawValue = Long.parseLong(descMap.value, 16)
+        log.info "${device.label ?: device.name}: ELECTRICAL DECODED: attr=0x${String.format('%04X', attrId)}, " +
+            "decimal=${rawValue}"
 
         switch (attrId) {
-            case ATTR_ACTIVE_POWER:  // ActivePower in milliwatts
-                def power = Math.round(rawValue / 100.0) / 10.0  // mW → W with 1 decimal
-                if (relayNum >= 1 && relayNum <= 2) {
-                    sendEvent(name: "power${relayNum}", value: power, unit: "W")
-                    updateChildDevice(relayNum, "power", power)
-
-                    def p1 = relayNum == 1 ? power : (device.currentValue("power1") ?: 0)
-                    def p2 = relayNum == 2 ? power : (device.currentValue("power2") ?: 0)
-                    def total = Math.round((p1 + p2) * 10) / 10.0
-                    sendEvent(name: "power", value: total, unit: "W")
-
-                    logSignificantChange("power${relayNum}", power, 1.0, "Relay ${relayNum} power: ${power}W")
-                    calculatePowerFactorForEndpoint(relayNum)
-                }
+            case ATTR_ACTIVE_POWER:   // 0x0008
+            case ATTR_RMS_POWER:      // 0x000D
+                processPowerValue(rawValue, relayNum, attrId)
                 break
 
-            case ATTR_VOLTAGE:  // Voltage in millivolts
-                def voltage = Math.round(rawValue / 100.0) / 10.0  // mV → V with 1 decimal
-                sendEvent(name: "voltage", value: voltage, unit: "V")
-                logSignificantChange("voltage", voltage, 1.0, "Voltage: ${voltage}V")
+            case ATTR_VOLTAGE:        // 0x0004
+            case ATTR_RMS_VOLTAGE:    // 0x000B
+                processVoltageValue(rawValue, attrId)
                 break
 
-            case ATTR_ACTIVE_CURRENT:  // Current in milliamps
-                def current = Math.round(rawValue) / 1000.0  // mA → A with 3 decimals
-                if (relayNum >= 1 && relayNum <= 2) {
-                    sendEvent(name: "current${relayNum}", value: current, unit: "A")
-                    updateChildDevice(relayNum, "current", current)
+            case ATTR_ACTIVE_CURRENT: // 0x0005
+            case ATTR_RMS_CURRENT:    // 0x000C
+            case ATTR_APPARENT_CURRENT: // 0x0007
+                processCurrentValue(rawValue, relayNum, attrId)
+                break
 
-                    def c1 = relayNum == 1 ? current : (device.currentValue("current1") ?: 0)
-                    def c2 = relayNum == 2 ? current : (device.currentValue("current2") ?: 0)
-                    def total = Math.round((c1 + c2) * 1000) / 1000.0
-                    sendEvent(name: "current", value: total, unit: "A")
-
-                    logSignificantChange("current${relayNum}", current, 0.01, "Relay ${relayNum} current: ${current}A")
-                    calculatePowerFactorForEndpoint(relayNum)
+            case ATTR_POWER_FACTOR:   // 0x000F
+                def pf = rawValue / 100.0
+                if (pf >= 0 && pf <= 1.0) {
+                    sendEvent(name: "powerFactor${relayNum}", value: pf)
+                    log.info "${device.label ?: device.name}: Relay ${relayNum} power factor: ${pf}"
                 }
                 break
 
             default:
-                if (logEnable) logDebug "Unhandled power measurement attr 0x${String.format('%04X', attrId)}: ${rawValue}"
+                log.info "${device.label ?: device.name}: UNKNOWN electrical attr " +
+                    "0x${String.format('%04X', attrId)} = ${rawValue} (hex: ${descMap.value})"
                 break
         }
     } catch (Exception e) {
-        if (logEnable) logDebug "Error processing electrical power: ${e.message}"
+        log.warn "${device.label ?: device.name}: Error processing electrical: ${e.message}, value=${descMap.value}"
+    }
+}
+
+private void processPowerValue(long rawValue, int relayNum, int attrId) {
+    // Auto-detect scaling
+    def power = 0.0
+    if (rawValue > 100000) {
+        power = rawValue / 1000.0  // milliwatts to watts
+    } else if (rawValue > 10000) {
+        power = rawValue / 100.0   // centiwatts to watts
+    } else if (rawValue > 1000) {
+        power = rawValue / 10.0    // deciwatts to watts
+    } else {
+        power = rawValue as double // already watts
+    }
+    power = Math.round(power * 10) / 10.0
+
+    log.info "${device.label ?: device.name}: POWER: relay${relayNum} raw=${rawValue}, " +
+        "calculated=${power}W (attr=0x${String.format('%04X', attrId)})"
+
+    if (relayNum >= 1 && relayNum <= 2) {
+        sendEvent(name: "power${relayNum}", value: power, unit: "W")
+        updateChildDevice(relayNum, "power", power)
+
+        def p1 = relayNum == 1 ? power : (device.currentValue("power1") ?: 0)
+        def p2 = relayNum == 2 ? power : (device.currentValue("power2") ?: 0)
+        sendEvent(name: "power", value: Math.round((p1 + p2) * 10) / 10.0, unit: "W")
+
+        calculatePowerFactorForEndpoint(relayNum)
+    }
+}
+
+private void processVoltageValue(long rawValue, int attrId) {
+    def voltage = 0.0
+    if (rawValue > 100000) {
+        voltage = rawValue / 1000.0  // millivolts
+    } else if (rawValue > 10000) {
+        voltage = rawValue / 100.0   // centivolts
+    } else if (rawValue > 1000) {
+        voltage = rawValue / 10.0    // decivolts
+    } else {
+        voltage = rawValue as double // volts
+    }
+    voltage = Math.round(voltage * 10) / 10.0
+
+    log.info "${device.label ?: device.name}: VOLTAGE: raw=${rawValue}, " +
+        "calculated=${voltage}V (attr=0x${String.format('%04X', attrId)})"
+
+    sendEvent(name: "voltage", value: voltage, unit: "V")
+}
+
+private void processCurrentValue(long rawValue, int relayNum, int attrId) {
+    def current = rawValue / 1000.0  // default: milliamps to amps
+    current = Math.round(current * 1000) / 1000.0
+
+    log.info "${device.label ?: device.name}: CURRENT: relay${relayNum} raw=${rawValue}, " +
+        "calculated=${current}A (attr=0x${String.format('%04X', attrId)})"
+
+    if (relayNum >= 1 && relayNum <= 2) {
+        sendEvent(name: "current${relayNum}", value: current, unit: "A")
+        updateChildDevice(relayNum, "current", current)
+
+        def c1 = relayNum == 1 ? current : (device.currentValue("current1") ?: 0)
+        def c2 = relayNum == 2 ? current : (device.currentValue("current2") ?: 0)
+        sendEvent(name: "current", value: Math.round((c1 + c2) * 1000) / 1000.0, unit: "A")
+
+        calculatePowerFactorForEndpoint(relayNum)
     }
 }
 
@@ -542,13 +735,27 @@ private void processElectricalPower(Map descMap, int endpoint, int attrId, int r
 // Electrical Energy Measurement Processing (Cluster 0x0091)
 // ---------------------------------------------------------------------------
 private void processElectricalEnergy(Map descMap, int endpoint, int attrId, int relayNum) {
-    if (!descMap.value || attrId != ATTR_CUMULATIVE_ENERGY_IMPORTED) return
+    if (!descMap.value) return
+
+    log.info "${device.label ?: device.name}: ENERGY: ep=${endpoint}(relay${relayNum}), " +
+        "attr=0x${String.format('%04X', attrId)}, rawHex=${descMap.value}"
 
     try {
         def rawValue = Long.parseLong(descMap.value, 16)
+        log.info "${device.label ?: device.name}: ENERGY DECODED: decimal=${rawValue}"
 
-        // Matter reports energy in milliwatt-hours (mWh)
-        def energy = Math.round(rawValue / 1000.0) / 1000.0  // mWh → kWh with 6 decimals
+        // Auto-detect scaling
+        def energy = 0.0
+        if (rawValue > 1000000) {
+            energy = rawValue / 1000000.0  // milliwatt-hours to kWh
+        } else if (rawValue > 1000) {
+            energy = rawValue / 1000.0     // watt-hours to kWh
+        } else {
+            energy = rawValue as double    // already kWh
+        }
+        energy = Math.round(energy * 1000000) / 1000000.0
+
+        log.info "${device.label ?: device.name}: ENERGY: relay${relayNum} raw=${rawValue}, calculated=${energy} kWh"
 
         if (relayNum >= 1 && relayNum <= 2) {
             sendEvent(name: "energy${relayNum}", value: energy, unit: "kWh")
@@ -556,24 +763,10 @@ private void processElectricalEnergy(Map descMap, int endpoint, int attrId, int 
 
             def e1 = relayNum == 1 ? energy : (device.currentValue("energy1") ?: 0)
             def e2 = relayNum == 2 ? energy : (device.currentValue("energy2") ?: 0)
-            def total = Math.round((e1 + e2) * 1000000) / 1000000.0
-            sendEvent(name: "energy", value: total, unit: "kWh")
-
-            logSignificantChange("energy${relayNum}", energy, 0.001, "Relay ${relayNum} energy: ${energy} kWh")
+            sendEvent(name: "energy", value: Math.round((e1 + e2) * 1000000) / 1000000.0, unit: "kWh")
         }
     } catch (Exception e) {
-        if (logEnable) logDebug "Error processing energy: ${e.message}"
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Logging helper – only logs when value changes significantly
-// ---------------------------------------------------------------------------
-private void logSignificantChange(String key, Number value, Number threshold, String message) {
-    def lastValue = state["lastLogged_${key}"] ?: 0
-    if (Math.abs(value - lastValue) >= threshold) {
-        if (txtEnable) logInfo message
-        state["lastLogged_${key}"] = value
+        log.warn "${device.label ?: device.name}: Error processing energy: ${e.message}"
     }
 }
 
@@ -596,7 +789,6 @@ private void createChildDevicesPair() {
                     isComponent: true
                 ])
 
-                // Initialize with current parent state
                 child.sendEvent(name: "switch", value: device.currentValue("switch${i}") ?: "off", isStateChange: true)
                 def power = device.currentValue("power${i}") ?: 0
                 if (power > 0) child.sendEvent(name: "power", value: power, unit: "W")
@@ -607,7 +799,7 @@ private void createChildDevicesPair() {
 
                 logInfo "Child device for Relay ${i} created and initialized"
             } catch (Exception e) {
-                if (logEnable) logDebug "Error creating child device: ${e.message}"
+                log.warn "${device.label ?: device.name}: Error creating child device: ${e.message}"
             }
         }
     }
@@ -619,7 +811,7 @@ private void removeChildDevices() {
             logInfo "Removing child device: ${child.label}"
             deleteChildDevice(child.deviceNetworkId)
         } catch (Exception e) {
-            if (logEnable) logDebug "Error removing child device: ${e.message}"
+            log.warn "${device.label ?: device.name}: Error removing child device: ${e.message}"
         }
     }
 }
@@ -640,9 +832,9 @@ private void updateChildDevice(int relayNum, String attribute, value) {
                     descriptionText: "Relay ${relayNum} is ${value}")
             }
 
-            if (logEnable) logDebug "Updated child ${relayNum}: ${attribute} = ${value}"
+            if (logEnable) log.debug "${device.label ?: device.name}: Updated child ${relayNum}: ${attribute} = ${value}"
         } catch (Exception e) {
-            if (logEnable) logDebug "Error updating child device ${relayNum}: ${e.message}"
+            if (logEnable) log.debug "${device.label ?: device.name}: Error updating child ${relayNum}: ${e.message}"
         }
     }
 }
@@ -660,10 +852,8 @@ def maintainChildStates() {
         def current = device.currentValue("current${i}") ?: 0
         def energy = device.currentValue("energy${i}") ?: 0
 
-        // Restore switch state if child lost it
         def childSwitch = child.currentValue("switch")
         if (!childSwitch || childSwitch != switchState) {
-            if (logEnable) logDebug "Child ${i} switch state mismatch (${childSwitch} vs ${switchState}), restoring..."
             child.sendEvent(name: "switch", value: switchState, isStateChange: true, displayed: true)
         }
 
@@ -689,7 +879,7 @@ def maintainChildStates() {
         }
     }
 
-    if (logEnable) logDebug "Child state maintenance complete"
+    if (logEnable) log.debug "${device.label ?: device.name}: Child state maintenance complete"
 }
 
 def syncChildDevices() {
@@ -754,7 +944,11 @@ void componentRefresh(cd) {
 // Matter Communication Helper
 // ---------------------------------------------------------------------------
 private void sendToDevice(String cmd) {
-    sendHubCommand(new hubitat.device.HubAction(cmd, hubitat.device.Protocol.MATTER))
+    if (cmd) {
+        sendHubCommand(new hubitat.device.HubAction(cmd, hubitat.device.Protocol.MATTER))
+    } else {
+        log.warn "${device.label ?: device.name}: sendToDevice called with null command!"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,11 +958,7 @@ private logInfo(msg) {
     if (txtEnable) log.info "${device.label ?: device.name}: ${msg}"
 }
 
-private logDebug(msg) {
-    if (logEnable) log.debug "${device.label ?: device.name}: ${msg}"
-}
-
 def logsOff() {
-    logInfo "Debug logging disabled"
+    log.info "${device.label ?: device.name}: Debug logging disabled"
     device.updateSetting("logEnable", [value: "false", type: "bool"])
 }
